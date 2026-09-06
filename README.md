@@ -1,118 +1,297 @@
-# JDBox_Athena
+# JDBox Athena Flash Tool
 
-京东云雅典娜 AX6600（RE-CS-02）本地全自动备份、受保护 U-Boot/Factory 固件刷写、rootfs 扩容与网络启动中断工具。默认连接
-`http://192.168.68.1/`，在局域网内完成 Telnet 检测/开启、root 登录、设备校验、
-GPT 与 p1-p26 备份、下载和 MD5/SHA256 校验。
+京东云雅典娜 AX6600（RE-CS-02）一站式备份与刷机工具，提供 Windows 图形界面和命令行入口。
 
-工具**不包含自动恢复功能**，所有刷写操作默认都不自动重启。默认备份流程不会写入任何分区；
-只有显式传入 `--flash-uboot`、`--flash-firmware` 或 `--resize-rootfs`、通过全部强制校验并输入哈希绑定的确认短语后，
-才会执行对应写入。
+它可以在局域网内自动完成 Telnet 探测与开启、root 登录、设备识别、GPT 与 p1-p26 备份、
+U-Boot 刷写、免按 Reset 进入 U-Boot Web、Factory 固件刷写，以及受保护的 rootfs 扩容。
+Windows 发布包已包含运行环境、配套 U-Boot、Factory 固件、Scapy 和 Npcap 安装程序；正常使用
+不需要另外准备 Telnet 客户端、TFTP/HTTP 服务器或 uBootEnter，浏览器也不是必需组件。
 
-## 功能与安全边界
+当前版本：**v0.6.0**
 
-- 先探测 TCP 23；已经开启 Telnet 时不会调用管理 API。
-- Telnet 未开启时，用后台密码调用 `/jdcapi` 的 `session/login` 获取临时
-  `ubus_rpc_session`。
-- 先尝试 r4546 的 `jdcapi.static/set_port_forward` 注入；端口仍未开放时，再尝试旧版
-  `set_iptv_info`。两种策略只能执行内置的 `factory_hm info telnet 1` 和对应固件所需的
-  `telnetd` 启动命令，CLI 不提供任意命令入口。
-- 不相信 JSON-RPC 的“成功”提示；只有实际连通 TCP 23 才继续。
-- root Telnet 密码默认与路由器后台密码相同。
-- 默认 `split` 模式先验证 p1-p26 全部存在，并检查 p13 `APPSBL`、p15 `ART` 标签；
-  然后备份主 GPT、备用 GPT 和 p1-p26。
-- 每个 split 文件都在路由器端计算 MD5/SHA256，下载后在电脑端重新计算并逐项比对；
-  校验成功后立即清理该临时文件。
-- `raw` 固定读取 `/dev/mmcblk0` 前 **2555 MiB**。数据通过 TCP 直接流到电脑，绝不把
-  2555 MiB 文件暂存在内置 p27；接收完成后会重新读取源区域并比对远端与本机的
-  MD5/SHA256。
-- 清理范围仅限带随机令牌的临时目录、Web 链接和临时进程。
-- U-Boot 模式只接受项目锁定的
-  `uboot-ipq60xx-jdcloud_re-cs-02-260816_142236_3011049.bin`：655,360 bytes，
-  MD5 `6071da758bc06dc284ae94f7417a3617`，SHA256
-  `fa4f13a4465a3271307ea7f6031f95b1e6420697539e4210721c2645541602cf`。
-- 刷写前必须严格匹配 JDCloud IPQ6018、p13 `0:APPSBL`、p14 `0:APPSBL_1` 和分区大小；
-  `--force-device` 对刷写无效。
-- 刷写前自动生成并校验 p13/p14 的新备份。随后把镜像传到路由器 `/tmp`，再次核对大小、
-  MD5 和 SHA256；输入确认短语后先写 p14 并回读校验，再写 p13 并回读校验。
-- 刷写完成后生成 `uboot-flash-report.json`，但绝不自动重启。
-- 已集成 `chenxin527/uBootEnter` 的网络中断协议：通过物理网卡广播
-  `UBOOT:ABORT` 到 UDP 37541，监听 UDP 37540 的 `UBOOT:ABORTED` 回复，随后验证
-  `/version` 并打开 U-Boot Web。此操作与备份/刷写互斥，也不会自动重启路由器。
-- Factory 固件模式只接受项目锁定的
-  `ones20250-main-pure-ipq60xx-jdcloud_re-cs-02-squashfs-factory-26.08.30-10.38.06.bin`：
-  32,980,572 bytes，MD5 `6608cce1adc444db393d00ceb3256515`，SHA256
-  `a2d706dc02a68159f90502d1b253c48bfb316e9e166033c520ec846b9094c1ab`。SHA256 与上游 Release
-  的 `sha256sums.txt` 一致。
-- 本地先校验固定哈希、ARM64 FIT、`jdcloud,re-cs-02` 标识，以及 6 MiB 偏移处的 SquashFS；
-  同时重新校验最近一次完整备份中的 GPT、BOOTCONFIG、APPSBL、ART、HLOS、rootfs、WIFIFW 和
-  rootfs_data。
-- 固件先通过 `/upload` 进入 U-Boot 内存；U-Boot 必须再次返回 `FIT Image`、相同大小及 MD5。
-  只有随后输入确认短语，工具才调用 `/result`，由配套 U-Boot 写入 `0:HLOS`、`rootfs` 并选择
-  firmware slot 0。不会改写 GPT、APPSBL、ART 或系统 1。
-- `/result` 不会自动重试；如果提交后连接中断，报告会标记 `write-result-unknown`，此时必须保持供电，
-  不得再次提交或断电。
-- rootfs 扩容固定提供 **512、1024、2048、8192 MiB** 四档。工具不使用通用 GPT 模板，而是完整校验
-  本机 GPT+p1-p26 备份后动态生成设备专属 GPT：p1-p17 的位置及全部分区 GUID 保持不变，扩展 p18，
-  顺移 p19-p26，并从末尾 p27 `storage` 扣除相同容量。
-- 扩容会使 p19-p27 的现有数据不可识别，包括原厂系统 1、`rootfs_data`、`plugin`、`log`、`swap`
-  和 `storage`。因此该入口会在 GPT 成功写入后连续刷入锁定 Factory 固件，GPT 与固件分别要求一次
-  哈希绑定确认；GPT 阶段始终禁止自动重启。
+[下载 Windows 版本](https://github.com/fishand73/JDBoxFlashTool/releases) ·
+[查看可视化教程](docs/JDBox_Athena_Windows_可视化操作教程.md)
 
-> 只应在你拥有或明确获准管理的雅典娜设备上使用。建议电脑用网线直连 LAN，操作期间
-> 不让路由器接入互联网，避免固件自动更新。开启后的 Telnet 服务可能在工具退出后仍然
-> 存在；备份完成后请按你的固件管理方式关闭 Telnet 或重启设备。
+> [!WARNING]
+> 本工具只应在你拥有或明确获准管理的京东云雅典娜 AX6600 上使用。刷写 U-Boot、系统固件或
+> GPT 都可能导致设备无法启动。请使用稳定电源和有线连接，先完成 `split` 备份并复制到另一块
+> 磁盘；日志出现“正在写入”后绝对不要断电、拔线、刷新页面或重复提交。
 
-> 刷写 U-Boot 或系统固件有变砖风险。必须使用稳定电源和有线连接，确认已有完整 GPT+p1-p26 备份；
-> 从第一次出现“正在写入”到两个分区回读校验完成之间绝对不要断电。
+> [!CAUTION]
+> “扩容 rootfs + 刷固件”会重建分区布局，p19-p27 中的原有数据将不可继续使用，其中包括
+> 原厂系统槽 1、`rootfs_data`、`plugin`、`log`、`swap` 和 `storage`。执行前必须先复制
+> `storage` 中需要保留的文件。
 
-## 环境
+## 功能一览
 
-- Python 3.9 或更高版本
-- 备份与 U-Boot 刷写无第三方运行时依赖
-- `--enter-uboot`、`--flash-firmware` 以及 `--resize-rootfs` 自动进入 U-Boot 时需要可选依赖 Scapy；Windows 还需要安装 Npcap。
-  如果已经手动进入 U-Boot Web，固件上传/刷写本身只使用 Python 标准库
-- 原厂固件必须仍保留已知 `/jdcapi` 行为；修复漏洞的新固件可能无法自动开启 Telnet
-- `split` 模式需要可写临时挂载点：优先 U 盘，其次自动使用 `/mnt/mmcblk0p27`
-- `raw` 模式要求电脑允许路由器连接一个本机 TCP 端口；Windows 防火墙弹窗时需允许当前
-  局域网访问
+| 任务 | 自动完成的操作 | 写入范围 |
+| --- | --- | --- |
+| 自动备份 / 开启 Telnet | 探测并开启 Telnet、校验设备、备份 GPT+p1-p26 或 raw 前缀、核对 MD5/SHA256 | 不写设备分区 |
+| 刷写 U-Boot | 备份 p13/p14、校验锁定镜像、先写备用 APPSBL、再写主 APPSBL、逐个回读 | p14、p13 |
+| 进入 U-Boot Web | 通过网卡发送启动中断包，等待并验证 U-Boot Web | 不写设备分区 |
+| 刷写 Factory 固件 | 校验备份与锁定固件、上传 U-Boot 内存复核、写系统槽 0 | `0:HLOS`、`rootfs` |
+| 扩容 rootfs + 刷固件 | 从本机备份生成专属 GPT，扩容后连续刷入 Factory 固件 | 主/备 GPT、`0:HLOS`、`rootfs` |
 
-## 快速开始
+所有危险写入都必须通过设备、分区、文件格式和哈希校验，并在独立确认窗口中完整输入现场生成的
+确认短语。直接回车、输入错误、取消或关闭确认窗口都不会开始写入。
 
-### Windows 图形版（推荐）
+![rootfs 扩容界面](docs/images/07-resize-rootfs.png)
 
-已提供原生 Windows 图形界面，双击源码入口或从 PowerShell 启动：
+## Windows 快速开始
+
+发布包面向 64 位 Windows，使用时不需要安装 Python。
+
+1. 从 [Releases](https://github.com/fishand73/JDBoxFlashTool/releases) 下载并解压整个
+   `JDBox_Athena_v0.6.0` 目录，不要只复制 EXE。
+2. 用网线连接电脑和路由器 LAN 口，建议操作期间断开路由器的互联网连接。
+3. 双击 `JDBox_Athena_v0.6.0.exe`。
+4. 第一次使用先选择“自动备份 / 开启 Telnet”，使用推荐的 `split` 模式。
+5. 确认备份报告为 `complete`，并把整个备份目录复制到其他磁盘。
+6. 再根据需要刷写 U-Boot、刷写 Factory 固件，或扩容 rootfs 后刷入固件。
+
+### 常用默认值
+
+| 设置 | 默认值 | 说明 |
+| --- | --- | --- |
+| 京东云原厂管理地址 | `http://192.168.68.1/` | 修改过网段时填写实际地址 |
+| 后台 / Telnet 用户名 | `root` | Shell/API 默认用户名 |
+| 后台 / Telnet 密码 | 空 | 填写首次配置路由器时设置的管理员密码；官方没有统一出厂密码 |
+| Telnet 端口 | `23` | 一般无需修改 |
+| U-Boot Web 地址 | `http://192.168.1.1/` | 配套 U-Boot 默认地址 |
+| 路由器临时挂载点 | 自动选择 | 优先可写 U 盘，其次 `/mnt/mmcblk0p27` |
+| 电脑局域网 IP | 自动检测 | 根据管理地址和系统路由选择 |
+| rootfs 目标大小 | `1024 MiB` | 可选择 512、1024、2048、8192 MiB |
+| 输出父目录 | EXE 所在目录 | 每次运行新建带时间戳的目录，不覆盖旧结果 |
+
+新 Factory 固件首次启动后的默认值为：管理地址 `192.168.10.1`、管理密码为空、Wi-Fi 名称
+`OWRT`、Wi-Fi 密码 `12345678`。首次登录后请立即设置管理密码并修改无线密码。
+
+### Npcap、管理员权限与高 DPI
+
+- 自动进入 U-Boot 需要 Npcap。发布包附带安装程序，界面检测到未安装时可直接点击“安装 Npcap”。
+- 普通备份通常不需要管理员权限；若底层网卡通信失败，可右键 EXE 选择“以管理员身份运行”。
+- 图形界面启用 Windows Per-Monitor V2，支持 125%、150%、200% 等缩放比例，并可在不同
+  DPI 的显示器之间自动调整。
+- 任务页支持滚动；耗时操作在后台线程执行，运行日志会持续更新。
+
+### 什么时候可以取消
+
+“取消当前任务”只在等待 U-Boot 启动或等待 Web 就绪的安全阶段启用。点击后会停止发包、监听和
+后续刷写流程。进入上传、校验或实际写入阶段后，该按钮会自动禁用。
+
+如果取消前已经收到 `UBOOT:ABORTED`，路由器可能仍停留在 U-Boot，可手动访问
+`http://192.168.1.1/` 或重新启动路由器。
+
+## 推荐操作顺序
+
+1. **备份**：执行 `split`，确认主/备 GPT、p1-p26、manifest 和校验清单完整。
+2. **另存备份**：将整个备份目录复制到另一块磁盘或可信存储。
+3. **刷 U-Boot（按需）**：完成 p13/p14 回读校验后再继续。
+4. **进入 U-Boot**：可以单独执行，也可以让 Factory/扩容流程自动等待并中断启动。
+5. **选择系统操作**：
+   - 不改变分区大小：选择“刷写 Factory 固件”；
+   - 需要更大 overlay：选择“扩容 rootfs + 刷固件”。
+6. **核对报告**：所有相关报告均为 `complete` 后，再启动新系统。
+
+如果只需要备份，完成第 1、2 步即可，不需要执行任何写入操作。
+
+## 备份模式
+
+| 模式 | 内容 | 特点 |
+| --- | --- | --- |
+| `split` | 主 GPT、备用 GPT、p1-p26 独立文件 | 首次使用和刷写前必做，推荐 |
+| `raw` | `/dev/mmcblk0` 前 2555 MiB | 直接通过 TCP 流向电脑，不占用路由器内部临时空间 |
+| `both` | 同时执行 split 和 raw | 占用空间和时间更多 |
+
+`split` 会先检查 p1-p26 是否完整以及 APPSBL/ART 标签是否匹配。每个文件先在路由器端计算
+MD5/SHA256，下载后再由电脑复算；只有校验成功的文件才会写入 manifest。
+
+`raw` 不会把 2555 MiB 镜像暂存在 p27。传输完成后，程序重新读取源区域，并比较远端与本机的
+MD5/SHA256。
+
+## 自动开启 Telnet 的边界
+
+- 已经可以连接 TCP 23 时，不调用管理 API。
+- Telnet 未开启时，使用后台密码调用 `/jdcapi` 的 `session/login` 获取临时会话。
+- 先尝试 r4546 的 `jdcapi.static/set_port_forward` 策略，不兼容时再尝试旧版
+  `set_iptv_info` 策略。
+- 两种策略只能执行程序内置的 Telnet 开启命令；CLI 不提供任意命令执行入口。
+- JSON-RPC 返回成功不代表 Telnet 已开启，只有实际连接 TCP 23 成功后才会继续。
+- Telnet 密码默认与路由器后台密码相同。服务可能在工具退出后继续存在，备份完成后请按当前
+  固件的管理方式关闭 Telnet 或重启设备。
+
+原厂固件必须仍保留已知 `/jdcapi` 行为；已经修复相关接口的版本可能无法自动开启 Telnet。
+
+## 受保护地刷写 U-Boot
+
+刷写前会重新备份 p13/p14，并严格检查设备为 JDCloud IPQ6018、分区标签为 `0:APPSBL` 和
+`0:APPSBL_1`、分区大小正确、镜像与锁定哈希一致。`--force-device` 对刷写无效。
+
+确认后按以下顺序执行：
+
+1. 将镜像传到路由器 `/tmp`，再次核对大小、MD5 和 SHA256；
+2. 输入 `FLASH-UBOOT-...` 确认短语；
+3. 先写 p14 并回读校验；
+4. 再写 p13 并回读校验；
+5. 生成 `uboot-flash-report.json`，保持路由器不自动重启。
+
+命令行示例：
 
 ```powershell
-python athena_gui.py
+python athena_backup.py --flash-uboot --verbose
 ```
 
-界面提供五个互相独立的入口：
+## 免按 Reset 进入 U-Boot Web
 
-1. **自动备份 / 开启 Telnet**：支持 `split`、`raw`、`both`，Telnet 未开启时自动尝试
-   内置的两种管理接口策略；
-2. **刷写 U-Boot**：先备份 p13/p14，再执行设备、镜像、远端与回读校验；
-3. **刷写 Factory 固件**：自动查找或手动选择完整 split 备份，连接不到 U-Boot Web 时可自动
-   启动 uBootEnter；
-4. **扩容 rootfs + 刷固件**：从完整备份生成本机专属 GPT，可选择 512/1024/2048/8192 MiB，
-   受保护地写入 GPT 后连续刷入 Factory 固件；
-5. **进入 U-Boot Web**：选择物理网卡后等待路由器上电或重启。
+工具集成 [chenxin527/uBootEnter](https://github.com/chenxin527/uBootEnter) 的网络启动中断协议：
+通过物理网卡向 UDP 37541 广播 `UBOOT:ABORT`，监听 UDP 37540 的 `UBOOT:ABORTED` 回复，
+随后验证 `/version` 是否就绪。
 
-耗时操作都在后台线程执行，窗口会持续显示日志。密码只保存在当前进程内，不会显示在日志、
-报告或命令行参数中。U-Boot 和 Factory 固件真正写入前，仍必须在独立红色警告窗口中完整输入
-与镜像 SHA256 绑定的确认短语；取消或关闭确认窗口不会写入闪存。
-图形版等待 U-Boot 启动或等待 Web 就绪时会启用“取消当前任务”，用于停止发包、监听和后续固件流程；
-进入固件上传、校验或实际写入阶段后该按钮会自动禁用。
+```powershell
+# 查看物理网卡
+python athena_backup.py --list-interfaces
 
-图形版启用 Windows Per-Monitor V2 高 DPI 模式，自动适配 125%、150%、200% 等系统缩放，
-并在窗口移到不同缩放比例的显示器后更新 Tk 字体缩放。任务页支持滚动，小尺寸高 DPI 屏幕也能
-访问底部操作按钮；右上角会显示当前检测到的缩放比例。
+# 使用全部物理网卡等待
+python athena_backup.py --enter-uboot
 
-图形版默认在可执行文件所在目录（源码运行时为项目根目录）为每次运行新建带时间戳的目录，
-避免覆盖旧备份或报告；也可以通过“输出父目录”手动选择其他位置。
-“路由器临时挂载点”默认自动选择可用 U 盘，找不到时使用 `/mnt/mmcblk0p27`；“电脑局域网 IP”
-默认根据路由器管理地址和系统路由自动检测。两个字段都可以手动填写以覆盖自动选择结果。
+# 使用指定网卡索引，不自动打开浏览器
+python athena_backup.py --enter-uboot 7 --no-open-browser
+```
 
-### 构建可双击运行的 Windows 程序
+开始显示“现在请给路由器通电或重启”后，再给路由器上电或手动重启。该功能不会主动重启设备，
+也不需要后台密码或 Telnet。
+
+## 刷写锁定的 Factory 固件
+
+Factory 固件通过配套 U-Boot Web 的 `/upload` 和 `/result` 接口刷写，不在原厂 Linux 中直接
+`dd` 系统分区。
+
+写入前会完成以下检查：
+
+1. 验证完整 split 备份中的恢复关键文件；
+2. 验证 Factory 固件的固定哈希、ARM64 FIT、`jdcloud,re-cs-02` 标识和 SquashFS 结构；
+3. 将固件上传到 U-Boot 内存，要求 U-Boot 返回 `FIT Image`、相同大小和相同 MD5；
+4. 输入 `FLASH-FIRMWARE-...` 确认短语后，才写入系统槽 0 的 `0:HLOS` 和 `rootfs`。
+
+单独刷 Factory 不会修改 GPT、APPSBL、ART 或系统槽 1。默认刷写完成后停留在 U-Boot Web。
+
+```powershell
+# U-Boot Web 已经就绪
+python athena_backup.py --flash-firmware --uboot-web-url http://192.168.1.1/
+
+# 先使用第 7 块网卡自动进入 U-Boot
+python athena_backup.py --flash-firmware 7
+
+# 明确指定备份并在成功后自动重启
+python athena_backup.py --flash-firmware 7 `
+  --firmware-backup D:\AthenaBackup\Athena_AX6600_backup_20260902_003551 `
+  --firmware-reboot
+```
+
+如果 `/result` 提交后连接中断，报告会标记 `write-result-unknown`。此时不要断电或再次提交，
+应保持供电至少 10 分钟，再根据 U-Boot Web、串口或启动状态人工判断。
+
+## 扩容 rootfs + 刷固件
+
+原厂 GPT 中的 `rootfs` 只有 60 MiB。图形界面固定提供 512、1024、2048、8192 MiB 四档，
+默认选择 1024 MiB；命令行必须显式指定目标大小。
+
+### 分区调整规则
+
+工具不会套用其他设备的通用 GPT，而是从所选备份动态生成本机专属 GPT。
+所有分区 GUID 均保持不变。
+
+| 分区 | 处理方式 |
+| --- | --- |
+| p1-p17 | 分区项逐字节保留，位置和 GUID 不变 |
+| p18 `rootfs` | 起点不变，终点扩展到所选容量 |
+| p19-p26 | 大小和 GUID 不变，整体向后顺移 |
+| p27 `storage` | 起点向后顺移、终点不变，容量相应缩小 |
+
+### 写入前校验
+
+- 复算主/备 GPT 和 p1-p26 共 28 个备份文件的 SHA256；
+- 校验主、备用 GPT 的头部 CRC32、分区项 CRC32、磁盘 GUID 和分区项一致性；
+- 校验 27 个分区标签、关键分区几何，以及 p1-p26 文件大小与 GPT 声明一致；
+- 重新计算新 GPT 的 CRC32，并再次解析验证；
+- 在第一次危险确认前，提前完成锁定 Factory 固件及恢复备份校验。
+
+新 GPT 上传到 U-Boot 内存后，还必须被识别为 `GPT (Single Image for eMMC device)`，且大小
+和 MD5 与本地一致。随后需要完成两次独立确认：
+
+1. 输入 `WRITE-GPT-...`，写入主/备 GPT；该阶段固定不重启；
+2. 输入 `FLASH-FIRMWARE-...`，继续刷入锁定 Factory 固件。
+
+```powershell
+python athena_backup.py --resize-rootfs 1024 --resize-interface 7 `
+  --firmware-backup D:\AthenaBackup\Athena_AX6600_backup_20260902_003551
+```
+
+工具只允许扩容，不允许把较大的 rootfs 缩回较小档位。完成后，
+`rootfs-resize-report.json` 和 `firmware-flash-report.json` 都必须为 `complete`。
+
+> [!WARNING]
+> 如果 GPT 已经写入成功，但 Factory 刷写失败，请不要让路由器启动旧系统。保持在 U-Boot Web，
+> 使用“刷写 Factory 固件”重新提交锁定镜像。
+
+## 锁定镜像
+
+程序只接受下列内容完全一致的镜像副本，文件名可以不同，但大小和哈希必须匹配。
+
+<details>
+<summary>查看 U-Boot 与 Factory 镜像信息</summary>
+
+### U-Boot
+
+- 文件：`uboot-ipq60xx-jdcloud_re-cs-02-260816_142236_3011049.bin`
+- 大小：655,360 bytes
+- MD5：`6071da758bc06dc284ae94f7417a3617`
+- SHA256：`fa4f13a4465a3271307ea7f6031f95b1e6420697539e4210721c2645541602cf`
+
+### Factory 固件
+
+- 文件：`ones20250-main-pure-ipq60xx-jdcloud_re-cs-02-squashfs-factory-26.08.30-10.38.06.bin`
+- 大小：32,980,572 bytes
+- MD5：`6608cce1adc444db393d00ceb3256515`
+- SHA256：`a2d706dc02a68159f90502d1b253c48bfb316e9e166033c520ec846b9094c1ab`
+
+</details>
+
+## 从源码运行
+
+需要 Python 3.9 或更高版本。备份与 U-Boot 刷写仅使用标准库；自动进入 U-Boot 需要 Scapy，
+Windows 还必须安装 Npcap 驱动。
+
+```powershell
+# 图形界面
+python -m pip install -e ".[windows-gui]"
+python athena_gui.py
+
+# 命令行默认执行 split 备份
+python athena_backup.py
+
+# 查看全部参数
+python athena_backup.py --help
+```
+
+常用备份参数：
+
+```powershell
+# 指定管理地址和输出目录
+python athena_backup.py --url http://192.168.68.1/ --output D:\AthenaBackup
+
+# raw 或 split+raw
+python athena_backup.py --mode raw
+python athena_backup.py --mode both
+
+# 手动指定路由器临时挂载点或电脑局域网 IP
+python athena_backup.py --remote-target /mnt/sda1
+python athena_backup.py --mode raw --pc-host 192.168.68.10
+```
+
+密码省略时会在终端安全询问，不建议通过 `--password` 直接传入，以免被命令历史保存。
+
+## 构建 Windows 程序
 
 在 64 位 Windows PowerShell 中运行：
 
@@ -120,310 +299,92 @@ python athena_gui.py
 .\build_windows.ps1
 ```
 
-脚本会安装锁定范围内的 Scapy/PyInstaller，并生成：
+构建结果：
 
 ```text
 dist\JDBox_Athena_v0.6.0\JDBox_Athena_v0.6.0.exe
 ```
 
-这是目录版程序，发布或移动时应保留整个 `dist\JDBox_Athena_v0.6.0` 目录。固定 U-Boot、Factory 固件、
-Npcap 安装器、README 和第三方声明会一并打包。Scapy 会被包含在程序中，但 Npcap 是 Windows
-网络驱动，仍须安装到系统；界面会检测状态，并可由用户点击“安装 Npcap”后确认 UAC。
+这是 PyInstaller 目录版程序，发布或移动时必须保留整个 `JDBox_Athena_v0.6.0` 目录。
+程序目录包含固定 U-Boot、Factory 固件、Npcap 安装器、README 和第三方声明，但不包含可视化教程。
 
-已经自行准备好构建环境时，可跳过依赖安装：
+已经准备好构建环境时，可以跳过依赖安装：
 
 ```powershell
 .\build_windows.ps1 -SkipInstall
 ```
 
-### 命令行版
-
-在项目目录运行：
-
-```powershell
-python athena_backup.py
-```
-
-程序只会交互询问一次：
-
-```text
-路由器后台/Telnet 密码:
-```
-
-原厂系统默认管理地址是 `http://192.168.68.1/`，Shell/API 用户名是 `root`，默认模式是推荐的
-`split`。京东云官方没有统一的出厂管理密码：首次配置时会要求设置管理员密码，工具中应填写该密码
-（它不一定与 Wi-Fi 密码相同）。
-
-指定其他地址或输出目录：
-
-```powershell
-python athena_backup.py --url http://192.168.68.1/ --output D:\AthenaBackup
-```
-
-也兼容只传 IP 的旧写法：
-
-```powershell
-python athena_backup.py --host 192.168.68.1
-```
-
-完整 2555 MiB raw 前缀备份：
-
-```powershell
-python athena_backup.py --mode raw
-```
-
-如果电脑有多个网卡，明确告诉路由器连接哪个局域网 IP：
-
-```powershell
-python athena_backup.py --mode raw --pc-host 192.168.68.10
-```
-
-同时执行 split 与 raw：
-
-```powershell
-python athena_backup.py --mode both
-```
-
-## 刷写项目锁定的 U-Boot
-
-确认项目根目录存在指定文件后运行：
-
-```powershell
-python athena_backup.py --flash-uboot --verbose
-```
-
-流程会先连接设备并重新备份 p13/p14；所有非破坏性检查完成后才显示如下哈希绑定确认：
-
-```text
-请输入 FLASH-UBOOT-FA4F13A4465A 以确认刷写:
-```
-
-只有完全一致地输入该短语才会开始写入。直接回车、关闭窗口或输入其他内容都不会写分区。
-镜像可位于其他目录，但内容仍必须与锁定哈希完全相同：
-
-```powershell
-python athena_backup.py --flash-uboot --uboot-image D:\Images\uboot-ipq60xx-jdcloud_re-cs-02-260816_142236_3011049.bin
-```
-
-成功后检查新输出目录中的 `uboot-flash-report.json`，确认 `status` 为 `complete` 且 p13、
-p14 的回读 SHA256 都与镜像一致。工具不会重启路由器。
-
-## 刷写项目锁定的 Factory 固件
-
-此功能通过配套 U-Boot Web 的原生 `/upload`、`/result` 接口完成，不在原厂 Linux 中直接 `dd`
-系统分区。默认镜像就是项目根目录中的 ones20250 PURE Factory 文件，并强制验证上游发布哈希。
-
-若 U-Boot Web 已经打开，可直接运行：
-
-```powershell
-python athena_backup.py --flash-firmware --uboot-web-url http://192.168.1.1/
-```
-
-若路由器仍在正常系统中，可指定连接 LAN 的有线网卡，由工具先运行 uBootEnter：
-
-```powershell
-python athena_backup.py --flash-firmware 7
-```
-
-看到“现在请给路由器通电或重启”后再重启路由器。工具会依次：
-
-1. 自动选择并完整校验最近的 `Athena_AX6600_backup_*`；
-2. 校验本地 Factory 文件格式及锁定 SHA256；
-3. 确认目标是 U-Boot Web，再把文件上传到内存；
-4. 比较 U-Boot 返回的类型、大小和 MD5；
-5. 要求输入 `FLASH-FIRMWARE-A2D706DC02A6`；
-6. 写 `0:HLOS`、`rootfs` 并生成 `firmware-flash-report.json`。
-
-指定其他备份位置或同内容的镜像副本：
-
-```powershell
-python athena_backup.py --flash-firmware 7 `
-  --firmware-backup D:\Code\JDBox_Athena\Athena_AX6600_backup_20260902_003551 `
-  --firmware-image D:\Images\ones20250-main-pure-ipq60xx-jdcloud_re-cs-02-squashfs-factory-26.08.30-10.38.06.bin
-```
-
-默认刷完后停留在 U-Boot Web；确认需要直接启动新系统时才显式加入：
-
-```powershell
-python athena_backup.py --flash-firmware 7 --firmware-reboot
-```
-
-新系统的发布默认值为：管理地址 `192.168.10.1`、管理密码为空、Wi-Fi `OWRT`、密码
-`12345678`。首次进入后应立即设置管理密码并修改无线密码。使用原厂 GPT 可以启动该固件，但原厂
-`rootfs` 只有 60 MiB，overlay 可用空间会较小；单独“刷写 Factory 固件”不会重写 GPT。
-
-## 扩容 rootfs 并刷写 Factory 固件
-
-图形界面的“扩容 rootfs + 刷固件”提供 512、1024、2048、8192 MiB 四个固定选项，默认选择
-1024 MiB。命令行必须显式给出目标大小，例如：
-
-```powershell
-python athena_backup.py --resize-rootfs 1024 --resize-interface 7 `
-  --firmware-backup D:\AthenaBackup\Athena_AX6600_backup_20260902_003551
-```
-
-这个入口不是直接套用网上的固定 GPT 文件。程序会先完成以下只读预检：
-
-1. 对备份中的主/备 GPT 和 p1-p26 共 28 个文件逐项复算 SHA256；
-2. 校验主 GPT 的头部 CRC32、分区项 CRC32、磁盘容量、27 个标签及雅典娜关键分区几何；
-3. 校验 p1-p26 备份大小与 GPT 声明一致；
-4. 保留 p1-p17 的完整分区项及全部 GUID，扩展 p18 `rootfs`，顺移 p19-p26，并缩小 p27
-   `storage`；
-5. 重新计算两项 GPT CRC32，写出 `gpt-rootfs-目标MiB.bin`，再重新解析验证；
-6. 在第一次危险确认出现之前，也先校验锁定 Factory 固件及其恢复备份。
-
-新 GPT 上传到 U-Boot 内存后，U-Boot 必须将其识别为
-`GPT (Single Image for eMMC device)`，且返回的大小和 MD5 与本地一致。输入现场显示的
-`WRITE-GPT-...` 短语后才写入主/备 GPT，且此阶段固定不重启；随后程序继续执行现有 Factory
-固件流程，并再次要求输入独立的 `FLASH-FIRMWARE-...` 短语。
-
-> 这是高风险且有意破坏数据的操作。p19-p27 的起始位置会变化，原厂系统槽 1、
-> `rootfs_data`、`plugin`、`log`、`swap` 和 `storage` 中的原有内容将无法继续使用。
-> 请先把 p27 中的个人数据另行复制，并将完整 split 备份保存到另一块磁盘。工具只允许扩容，
-> 不允许把已经较大的 rootfs 缩小。如果 GPT 已写入但 Factory 阶段失败，请不要重启，保持
-> U-Boot Web 并重试单独的 Factory 固件刷写。
-
-完成后检查同一输出目录中的 `rootfs-resize-report.json` 和
-`firmware-flash-report.json`，两者的 `status` 都应为 `complete`。
-
-## 免按 Reset 进入 U-Boot Web
-
-这部分集成自 [chenxin527/uBootEnter](https://github.com/chenxin527/uBootEnter)。锁定的
-U-Boot 镜像已经过本地扫描，确认包含 `UBOOT:ABORT` 和 `UBOOT:ABORTED` 两个协议标记。
-
-先安装可选依赖：
-
-```powershell
-python -m pip install -e ".[uboot-enter]"
-```
-
-Windows 还必须从 [Npcap 官网](https://npcap.com/#download) 安装 Npcap。若普通终端无法发送
-二层数据包，请使用管理员权限打开 PowerShell。
-
-查看可用物理网卡及其索引：
-
-```powershell
-python athena_backup.py --list-interfaces
-```
-
-使用全部物理网卡等待 U-Boot 启动：
-
-```powershell
-python athena_backup.py --enter-uboot
-```
-
-程序开始显示“现在请给路由器通电或重启”后，再给路由器上电或手动重启。收到
-`UBOOT:ABORTED` 后会等待 `/version` 就绪并打开默认浏览器。
-
-推荐明确指定连接路由器 LAN 口的有线网卡：
-
-```powershell
-python athena_backup.py --enter-uboot 7
-python athena_backup.py --enter-uboot "Realtek PCIe"
-```
-
-不打开浏览器或延长等待时间：
-
-```powershell
-python athena_backup.py --enter-uboot 7 --no-open-browser --enter-timeout 180
-```
-
-`uBootEnter` 不使用后台密码或 Telnet，也不会主动重启路由器。配套 U-Boot 的 `bootdelay`
-建议至少为 3 秒；如果超时，请确认网线直连 LAN、选对网卡、Npcap 正常工作，并在工具运行后
-再重启路由器。
-
-指定 U 盘作为 split 临时区：
-
-```powershell
-python athena_backup.py --remote-target /mnt/sda1
-```
-
-查看全部公开参数：
-
-```powershell
-python athena_backup.py --help
-```
-
-首次在真实设备上运行时可加 `--verbose`。若 APPSBL/ART 标签因固件差异无法读取，先人工
-核对 `device-info.txt`；只有确认设备与分区布局正确后才使用 `--force-device`。该选项也不能
-跳过 p1-p26 完整性检查。
-
-## 输出内容
-
-默认目录名形如 `Athena_AX6600_backup_20260902_012345`：
-
-```text
-backup-info.json       本次执行状态与模式（不记录密码/session）
-device-info.txt        型号、固件、块设备、挂载点等诊断信息
-gpt-primary.bin        主 GPT 头与分区表（split）
-gpt-backup.bin         备用 GPT 头与分区表（split）
-p01_*.bin ... p26_*.bin
-mmcblk0-prefix-2555MiB.img   raw 模式
-preflash_p13_0_APPSBL.bin    U-Boot 刷写前备份
-preflash_p14_0_APPSBL_1.bin  U-Boot 刷写前备份
-uboot-flash-report.json      分步写入与回读校验报告
-firmware-flash-report.json   U-Boot Web 双重校验与 Factory 写入结果
-gpt-rootfs-1024MiB.bin       从本机备份生成的设备专属 GPT（示例档位）
-rootfs-resize-report.json    GPT 几何变化、远端校验与写入结果
-manifest.json
-MD5SUMS
-SHA256SUMS
-```
-
-每个文件校验完成后才会进入 manifest。中途失败时，之前已完成并校验的文件会保留，
-`backup-info.json` 状态为 `incomplete`。
+## 输出文件
+
+每次任务都会创建独立的时间戳目录，例如 `Athena_AX6600_backup_20260902_012345`。
+
+| 文件 | 用途 |
+| --- | --- |
+| `backup-info.json` | 备份状态与模式，不记录密码和 session |
+| `device-info.txt` | 型号、固件、块设备、挂载点等诊断信息 |
+| `gpt-primary.bin` / `gpt-backup.bin` | 主、备用 GPT 备份 |
+| `p01_*.bin` … `p26_*.bin` | split 分区备份 |
+| `mmcblk0-prefix-2555MiB.img` | raw 前缀镜像 |
+| `manifest.json` / `MD5SUMS` / `SHA256SUMS` | 文件清单和完整性校验 |
+| `preflash_p13_*.bin` / `preflash_p14_*.bin` | U-Boot 刷写前备份 |
+| `uboot-flash-report.json` | 双 APPSBL 写入与回读报告 |
+| `firmware-flash-report.json` | Factory 内存复核与写入报告 |
+| `gpt-rootfs-目标MiB.bin` | 从本机备份生成的设备专属 GPT |
+| `rootfs-resize-report.json` | GPT 几何变化、远端校验与写入报告 |
+
+中途失败时，已经完成并通过校验的文件会保留；未完整完成的备份会在 `backup-info.json` 中标记为
+`incomplete`，不能作为后续刷写的合格恢复备份。
 
 ## 项目结构
 
 ```text
-athena_backup.py                 源码目录直接运行入口
-src/jdbox_athena/cli.py         参数、密码提示和日志
-src/jdbox_athena/jdcapi.py      session/login 与两种 Telnet 策略
-src/jdbox_athena/telnet_client.py  Python 3.13+ 可用的最小 Telnet 客户端
-src/jdbox_athena/device.py      设备信息、p1-p26 与 GPT 几何校验
-src/jdbox_athena/transfer.py    临时区、HTTP 下载、raw 直接流传输
-src/jdbox_athena/flash.py       固定镜像校验、上传、双 APPSBL 刷写和回读
-src/jdbox_athena/firmware_flash.py Factory 校验、备份复核、U-Boot Web 上传与写入
-src/jdbox_athena/partition_resize.py GPT 解析、全备份校验、设备专属扩容与受保护写入
-src/jdbox_athena/uboot_enter.py uBootEnter 数据包、网卡选择、回复与 Web 检测
-src/jdbox_athena/backup.py      工作流编排与清理
-src/jdbox_athena/integrity.py   MD5/SHA256 与 manifest
-src/jdbox_athena/gui.py         Windows 图形界面、后台日志与写入确认对话框
-athena_gui.py                    图形版源码入口
-build_windows.ps1               PyInstaller 目录版构建脚本
-tests/                           完全离线的基础测试
-third_party/uBootEnter/LICENSE   上游 MIT 许可证
-THIRD_PARTY_NOTICES.md           上游版本、许可与修改说明
-```
-
-也可以安装为命令：
-
-```powershell
-python -m pip install -e .
-athena-backup --help
+athena_gui.py                         Windows 图形界面入口
+athena_backup.py                      命令行入口
+build_windows.ps1                     PyInstaller 构建脚本
+src/jdbox_athena/gui.py               图形界面、后台任务和风险确认
+src/jdbox_athena/backup.py            备份工作流与清理
+src/jdbox_athena/jdcapi.py            登录与两种 Telnet 开启策略
+src/jdbox_athena/device.py            设备、分区和磁盘几何校验
+src/jdbox_athena/transfer.py          HTTP 下载与 raw 流式传输
+src/jdbox_athena/flash.py             U-Boot 校验、双 APPSBL 写入与回读
+src/jdbox_athena/firmware_flash.py    Factory 校验和 U-Boot Web 写入
+src/jdbox_athena/partition_resize.py  GPT 解析、生成、全备份校验与受保护写入
+src/jdbox_athena/uboot_enter.py       网卡选择、启动中断和 Web 检测
+src/jdbox_athena/integrity.py         MD5/SHA256 与 manifest
+tests/                                完全离线的自动测试
 ```
 
 ## 开发校验
 
-这些检查不会连接路由器：
+以下检查不会连接路由器：
 
 ```powershell
-python -m compileall -q athena_backup.py src tests
+python -m compileall -q athena_backup.py athena_gui.py src tests
 python -m unittest discover -s tests -v
 python -m ruff check .
 python -m mypy
 python athena_backup.py --help
 ```
 
-## 参考资料
+## 已知限制
+
+- 只支持京东云雅典娜 AX6600（RE-CS-02 / IPQ6018）和项目锁定的 U-Boot/Factory 镜像。
+- 不提供自动恢复或一键回滚，备份文件需要用户自行妥善保存。
+- 自动开启 Telnet 依赖原厂固件仍保留兼容的 `/jdcapi` 行为。
+- 自动进入 U-Boot 依赖兼容的配套 U-Boot、Scapy 和 Npcap。
+- rootfs 调整是破坏性重建布局，不会搬移 p19-p27 的旧文件系统，也不支持缩小。
+- 工具不能消除刷机风险；真实写入前仍应核对设备、镜像哈希、分区变化和确认短语。
+
+## 参考与致谢
 
 - [r4546 / set_port_forward 方法与备份讨论](https://www.right.com.cn/forum/thread-8478775-1-1.html)
 - [雅典娜免拆机刷机及 2555 MiB 备份讨论](https://www.right.com.cn/forum/forum.php?mod=viewthread&tid=8464665)
 - [legacy set_iptv_info 方法](https://www.right.com.cn/forum/forum.php?mod=viewthread&tid=8461568)
 - [chenxin527/uBootEnter](https://github.com/chenxin527/uBootEnter)
-- [配套 uBootKit 对雅典娜的支持说明](https://github.com/chenxin527/uboot-qsdk12.5-build)
+- [chenxin527/uboot-qsdk12.5-build](https://github.com/chenxin527/uboot-qsdk12.5-build)
 - [ones20250/Openwrt-AX6600](https://github.com/ones20250/Openwrt-AX6600)
 - [PURE 26.08.30-10.38.06 Release](https://github.com/ones20250/Openwrt-AX6600/releases/tag/IPQ60XX-WIFI-YES-PURE-ones20250-main-26.08.30-10.38.06)
 - [上游雅典娜刷机与恢复说明](https://github.com/ones20250/Openwrt-AX6600/blob/main/Docs/%E5%88%B7%E6%9C%BA%E6%95%91%E7%A0%96%E6%95%99%E7%A8%8B.md)
 
-实现不加载论坛提供的远程 JavaScript，相关逻辑全部保存在本项目中。
+第三方许可和修改说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。程序不会加载论坛提供的
+远程 JavaScript，相关逻辑均保存在本项目中。
