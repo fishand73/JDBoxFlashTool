@@ -21,6 +21,7 @@ dist/
 Athena_AX6600_backup_*/
 Athena_AX6600_uboot_flash_*/
 Athena_AX6600_firmware_flash_*/
+Athena_AX6600_rootfs_resize_*/
 
 # Unlocked local/experimental firmware images
 /qualcommax-*.bin

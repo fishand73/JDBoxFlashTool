@@ -39,3 +39,7 @@ class OperationCancelled(AthenaError):
 
 class FirmwareFlashError(AthenaError):
     """Factory image validation, U-Boot upload, or firmware write failed."""
+
+
+class PartitionResizeError(AthenaError):
+    """GPT validation, generation, upload, or partition-table write failed."""

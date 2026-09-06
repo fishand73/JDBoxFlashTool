@@ -31,6 +31,11 @@ from .constants import (
 from .errors import AthenaError, OperationCancelled
 from .firmware_flash import FirmwareFlasher, FirmwareFlashPlan, discover_backup
 from .flash import UbootFlashPlan
+from .partition_resize import (
+    ROOTFS_SIZE_CHOICES_MIB,
+    RootfsResizePlan,
+    RootfsResizer,
+)
 from .uboot_enter import InterfaceInfo, UbootEnterResult, UbootEnterService
 from .util import normalize_management_url
 
@@ -41,6 +46,7 @@ OPERATION_LABELS = {
     "backup": "自动备份 / 开启 Telnet",
     "flash-uboot": "刷写 U-Boot",
     "flash-firmware": "刷写 Factory 固件",
+    "resize-rootfs": "扩容 rootfs + 刷固件",
     "enter-uboot": "进入 U-Boot Web",
 }
 AUTO_REMOTE_TARGET = "自动选择（U 盘优先，其次 /mnt/mmcblk0p27）"
@@ -162,6 +168,7 @@ def new_output_path(parent: Path, operation: str, now: Optional[datetime] = None
         "backup": "Athena_AX6600_backup",
         "flash-uboot": "Athena_AX6600_uboot_flash",
         "flash-firmware": "Athena_AX6600_firmware_flash",
+        "resize-rootfs": "Athena_AX6600_rootfs_resize",
     }[operation]
     base = parent.expanduser().resolve() / f"{prefix}_{timestamp}"
     candidate = base
@@ -238,6 +245,7 @@ class OperationConfig:
     firmware_timeout: float
     open_browser: bool
     firmware_reboot: bool
+    rootfs_size_mib: int
     verbose: bool
 
 
@@ -299,8 +307,10 @@ class TypedConfirmationDialog(tk.Toplevel):
             justify="left",
         ).pack(anchor="w", fill="x", pady=(8, 12))
 
+        details_frame = ttk.Frame(body)
+        details_frame.pack(fill="both", expand=True)
         details = tk.Text(
-            body,
+            details_frame,
             height=12,
             wrap="word",
             relief="solid",
@@ -311,7 +321,14 @@ class TypedConfirmationDialog(tk.Toplevel):
         )
         details.insert("1.0", request.details)
         details.configure(state="disabled")
-        details.pack(fill="both", expand=True)
+        details_scrollbar = ttk.Scrollbar(
+            details_frame,
+            orient="vertical",
+            command=details.yview,
+        )
+        details.configure(yscrollcommand=details_scrollbar.set)
+        details_scrollbar.pack(side="right", fill="y")
+        details.pack(side="left", fill="both", expand=True)
 
         ttk.Label(body, text="请完整输入以下确认短语：").pack(anchor="w", pady=(14, 4))
         expected = ttk.Entry(body)
@@ -422,6 +439,7 @@ class AthenaGui:
         self.firmware_timeout = tk.StringVar(value="600")
         self.open_browser = tk.BooleanVar(value=True)
         self.firmware_reboot = tk.BooleanVar(value=False)
+        self.rootfs_size = tk.StringVar(value="1024 MiB")
         self.verbose = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="就绪")
         self.admin_status = tk.StringVar()
@@ -455,7 +473,7 @@ class AthenaGui:
         ttk.Label(header, text="JDBox Athena Windows 工具", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="雅典娜 AX6600（RE-CS-02）备份、U-Boot 与 Factory 固件受保护刷写",
+            text="雅典娜 AX6600（RE-CS-02）备份、U-Boot、rootfs 扩容与 Factory 固件受保护刷写",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         badges = ttk.Frame(header)
@@ -512,7 +530,13 @@ class AthenaGui:
                 variable=self.operation,
                 command=self._render_operation,
             )
-            button.grid(row=0, column=index, sticky="w", padx=(0, 22), pady=3)
+            button.grid(
+                row=index // 3,
+                column=index % 3,
+                sticky="w",
+                padx=(0, 28),
+                pady=3,
+            )
 
         common = ttk.LabelFrame(
             self.task_tab,
@@ -732,24 +756,46 @@ class AthenaGui:
                 "将先备份 p13/p14，再严格校验设备、固定镜像哈希、远端上传和回读结果。"
                 "最终写入前必须输入哈希绑定确认短语；软件不会自动重启。写入期间绝对不要断电。"
             )
-        elif operation == "flash-firmware":
-            self._add_entry(0, "Factory 固件", self.firmware_image, kind="file")
-            self._add_entry(1, "完整 split 备份", self.firmware_backup, kind="directory")
-            self._add_entry(2, "U-Boot Web 地址", self.uboot_web_url)
-            self._add_interface_row(3)
-            ttk.Label(self.details, text="最长请求秒数").grid(row=4, column=0, sticky="w", pady=5)
+        elif operation in {"flash-firmware", "resize-rootfs"}:
+            row = 0
+            if operation == "resize-rootfs":
+                ttk.Label(self.details, text="rootfs 目标大小").grid(
+                    row=row, column=0, sticky="w", pady=5
+                )
+                ttk.Combobox(
+                    self.details,
+                    textvariable=self.rootfs_size,
+                    values=tuple(f"{value} MiB" for value in ROOTFS_SIZE_CHOICES_MIB),
+                    state="readonly",
+                    width=16,
+                ).grid(row=row, column=1, sticky="w", padx=(10, 8), pady=5)
+                row += 1
+            self._add_entry(row, "Factory 固件", self.firmware_image, kind="file")
+            self._add_entry(row + 1, "完整 split 备份", self.firmware_backup, kind="directory")
+            self._add_entry(row + 2, "U-Boot Web 地址", self.uboot_web_url)
+            self._add_interface_row(row + 3)
+            ttk.Label(self.details, text="最长请求秒数").grid(
+                row=row + 4, column=0, sticky="w", pady=5
+            )
             ttk.Entry(self.details, textvariable=self.firmware_timeout, width=12).grid(
-                row=4, column=1, sticky="w", padx=(10, 8), pady=5
+                row=row + 4, column=1, sticky="w", padx=(10, 8), pady=5
             )
             ttk.Checkbutton(
                 self.details,
                 text="刷写成功后自动重启（默认关闭）",
                 variable=self.firmware_reboot,
-            ).grid(row=5, column=1, sticky="w", padx=(10, 0), pady=5)
-            warning = (
-                "若 U-Boot Web 未就绪，软件会用所选网卡等待上电/重启并中断启动。"
-                "固件上传到内存并二次校验后仍会要求输入确认短语；提交写入后禁止断电或重复提交。"
-            )
+            ).grid(row=row + 5, column=1, sticky="w", padx=(10, 0), pady=5)
+            if operation == "resize-rootfs":
+                warning = (
+                    "高风险：GPT 写入会顺移 p19-p26 并破坏 rootfs_data、plugin、log、swap、"
+                    "storage 的现有数据。必须使用本机完整备份，随后会连续刷入 Factory 固件；"
+                    "两次写入都需输入独立确认短语。"
+                )
+            else:
+                warning = (
+                    "若 U-Boot Web 未就绪，软件会用所选网卡等待上电/重启并中断启动。"
+                    "固件上传到内存并二次校验后仍会要求输入确认短语；提交写入后禁止断电或重复提交。"
+                )
         else:
             self._add_interface_row(0)
             ttk.Label(self.details, text="等待路由器秒数").grid(row=1, column=0, sticky="w", pady=5)
@@ -906,11 +952,18 @@ class AthenaGui:
         firmware_backup = Path(backup_text).expanduser().resolve() if backup_text else None
         if operation == "flash-uboot" and not uboot_image.is_file():
             raise AthenaError(f"找不到 U-Boot 镜像：{uboot_image}")
-        if operation == "flash-firmware":
+        if operation in {"flash-firmware", "resize-rootfs"}:
             if not firmware_image.is_file():
                 raise AthenaError(f"找不到 Factory 固件：{firmware_image}")
             if firmware_backup is not None and not firmware_backup.is_dir():
                 raise AthenaError(f"找不到 split 备份目录：{firmware_backup}")
+
+        try:
+            rootfs_size_mib = int(self.rootfs_size.get().split()[0])
+        except (IndexError, ValueError) as exc:
+            raise AthenaError("rootfs 目标大小无效。") from exc
+        if rootfs_size_mib not in ROOTFS_SIZE_CHOICES_MIB:
+            raise AthenaError("rootfs 目标大小必须选择 512、1024、2048 或 8192 MiB。")
 
         return OperationConfig(
             operation=operation,
@@ -936,6 +989,7 @@ class AthenaGui:
             firmware_timeout=float(firmware_timeout),
             open_browser=bool(self.open_browser.get()),
             firmware_reboot=bool(self.firmware_reboot.get()),
+            rootfs_size_mib=rootfs_size_mib,
             verbose=bool(self.verbose.get()),
         )
 
@@ -947,9 +1001,10 @@ class AthenaGui:
         except (AthenaError, OSError, ValueError) as exc:
             messagebox.showerror("设置有误", str(exc), parent=self.root)
             return
-        if config.operation in {"flash-uboot", "flash-firmware"} and not messagebox.askyesno(
+        risky_operations = {"flash-uboot", "flash-firmware", "resize-rootfs"}
+        if config.operation in risky_operations and not messagebox.askyesno(
             "确认启动预检",
-            "软件将先执行只读检查和备份。真正写入前还会要求输入哈希绑定确认短语。\n\n"
+            "软件将先执行只读检查和备份校验。真正写入前还会要求输入哈希绑定确认短语。\n\n"
             "请确认设备使用稳定电源并通过网线连接。是否开始？",
             icon="warning",
             parent=self.root,
@@ -1111,6 +1166,66 @@ class AthenaGui:
                     f"U-Boot 已返回写入成功，报告：{report.name}。{ending}",
                     output,
                 )
+            elif config.operation == "resize-rootfs":
+                output = new_output_path(config.output_parent, "resize-rootfs")
+                backup = discover_backup(
+                    config.firmware_backup,
+                    (application_root(), Path.cwd(), config.output_parent),
+                )
+                resizer = RootfsResizer(
+                    config.uboot_web_url,
+                    output,
+                    backup,
+                    config.rootfs_size_mib,
+                    timeout=config.firmware_timeout,
+                )
+                backup_info, generated = resizer.prepare()
+                flasher = FirmwareFlasher(
+                    config.uboot_web_url,
+                    output,
+                    config.firmware_image,
+                    backup,
+                    timeout=config.firmware_timeout,
+                )
+                # Do all local firmware checks before the first destructive write.
+                flasher.validate_image()
+                flasher.validate_backup()
+                if resizer.probe_version(required=False) is None:
+                    LOGGER.info("U-Boot Web 尚未就绪，启动网卡中断流程")
+                    entered = self._enter_uboot(config, open_browser=False)
+                    resizer.set_web_url(entered.web_url)
+                    flasher = FirmwareFlasher(
+                        entered.web_url,
+                        output,
+                        config.firmware_image,
+                        backup,
+                        timeout=config.firmware_timeout,
+                    )
+                resize_report = resizer.commit(
+                    backup_info,
+                    generated,
+                    self._confirm_resize,
+                )
+                LOGGER.warning(
+                    "GPT 已写入且未重启；继续刷写 Factory 固件。"
+                    "若后续失败，请保持在 U-Boot 并重试固件刷写。"
+                )
+                firmware_report = flasher.flash(
+                    self._confirm_firmware,
+                    auto_reboot=config.firmware_reboot,
+                )
+                ending = (
+                    "路由器将自动重启。"
+                    if config.firmware_reboot
+                    else "路由器仍停留在 U-Boot Web。"
+                )
+                result = RunResult(
+                    True,
+                    "rootfs 扩容与固件刷写完成",
+                    f"rootfs 已调整为 {config.rootfs_size_mib} MiB；"
+                    f"报告：{resize_report.name}、{firmware_report.name}。{ending}",
+                    output,
+                )
             else:
                 entered = self._enter_uboot(config, open_browser=config.open_browser)
                 result = RunResult(
@@ -1170,6 +1285,39 @@ class AthenaGui:
             ConfirmationRequest(
                 title="确认刷写 Factory 固件",
                 warning="确认后会覆盖系统 0 的内核与 rootfs。提交后禁止断电或重复提交。",
+                details=details,
+                phrase=plan.confirmation_phrase,
+            )
+        )
+
+    def _confirm_resize(self, plan: RootfsResizePlan) -> bool:
+        generated = plan.generated_gpt
+        change_lines = []
+        for change in generated.changes:
+            change_lines.append(
+                f"p{change.number} {change.label}: "
+                f"{change.old_first_lba}-{change.old_last_lba} → "
+                f"{change.new_first_lba}-{change.new_last_lba}"
+            )
+        details = (
+            f"设备专属 GPT：{generated.path}\n"
+            f"SHA256：{generated.sha256}\n"
+            f"U-Boot：{plan.web_url}（{plan.uboot_version}）\n"
+            f"内存校验：{dict(plan.upload_info)}\n"
+            f"恢复备份：{plan.backup.path}（已校验 {len(plan.backup.verified_files)} 个文件）\n"
+            f"rootfs：{generated.rootfs_old_mib} MiB → {generated.rootfs_new_mib} MiB\n"
+            f"storage：{generated.storage_old_mib:.2f} MiB → "
+            f"{generated.storage_new_mib:.2f} MiB\n\n"
+            "分区位置变化：\n" + "\n".join(change_lines) + "\n\n"
+            "p1-p17 的位置和全部分区 GUID 保持不变；确认后写主/备 GPT，且不会自动重启。"
+        )
+        return self._request_confirmation(
+            ConfirmationRequest(
+                title="确认调整 rootfs 分区",
+                warning=(
+                    "写入 GPT 会使 p19-p27 的原有文件系统/数据不可识别，包括原厂系统 1、"
+                    "rootfs_data、plugin、log、swap 和 storage。写入期间绝对不要断电。"
+                ),
                 details=details,
                 phrase=plan.confirmation_phrase,
             )

@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="JDBox.Athena.Windows"
-      version="0.5.4.0"
+      version="0.6.0.0"
       processorArchitecture="*" />
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$AppName = "JDBox_Athena_v0.5.6"
+$AppName = "JDBox_Athena_v0.6.0"
 Set-Location -LiteralPath $ProjectRoot
 
 if ($env:OS -ne "Windows_NT") {

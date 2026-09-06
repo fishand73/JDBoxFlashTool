@@ -41,6 +41,16 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["--flash-firmware", "--flash-uboot"])
 
+    def test_rootfs_resize_has_four_fixed_sizes(self) -> None:
+        parser = create_parser()
+        for size in (512, 1024, 2048, 8192):
+            args = parser.parse_args(["--resize-rootfs", str(size)])
+            self.assertEqual(args.resize_rootfs, size)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--resize-rootfs", "4096"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--resize-rootfs", "1024", "--flash-firmware"])
+
     def test_bare_host_is_normalized(self) -> None:
         url, host = normalize_management_url("192.168.68.1")
         self.assertEqual(url, DEFAULT_MANAGEMENT_URL)

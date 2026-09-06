@@ -8,7 +8,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 from .backup import AthenaBackupRunner, BackupOptions
 from .constants import (
@@ -28,6 +28,7 @@ from .firmware_flash import (
     discover_backup,
 )
 from .flash import UbootFlashPlan
+from .partition_resize import RootfsResizePlan, RootfsResizer
 from .uboot_enter import UbootEnterService, format_interfaces
 from .util import normalize_management_url, resolved_output
 
@@ -60,7 +61,7 @@ def create_parser() -> argparse.ArgumentParser:
         prog="athena_backup.py",
         description=(
             "京东云雅典娜 AX6600：自动检测/开启 Telnet，备份 GPT+p1-p26，"
-            "受保护地刷写锁定 U-Boot/Factory 固件，或通过网络进入 U-Boot Web。"
+            "受保护地刷写锁定 U-Boot/Factory 固件、扩容 rootfs，或通过网络进入 U-Boot Web。"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -100,6 +101,13 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     operation.add_argument(
+        "--resize-rootfs",
+        type=int,
+        choices=(512, 1024, 2048, 8192),
+        metavar="MIB",
+        help="基于完整备份生成设备专属 GPT，扩容 rootfs 后连续刷写锁定 Factory 固件",
+    )
+    operation.add_argument(
         "--enter-uboot",
         nargs="?",
         const="all",
@@ -126,6 +134,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--firmware-backup",
         help="刷固件前验证的完整 split 备份目录；默认自动选择项目中最新备份",
+    )
+    parser.add_argument(
+        "--resize-interface",
+        default="all",
+        metavar="INTERFACE",
+        help="扩容时传给 uBootEnter 的网卡索引/名称；默认使用全部物理网卡",
     )
     parser.add_argument(
         "--uboot-web-url",
@@ -290,6 +304,41 @@ def confirm_firmware_flash(plan: FirmwareFlashPlan) -> bool:
     return typed == plan.confirmation_phrase
 
 
+def confirm_rootfs_resize(plan: RootfsResizePlan) -> bool:
+    """Show every changed partition before committing the device-specific GPT."""
+
+    generated = plan.generated_gpt
+    LOGGER.warning("即将重写主/备 GPT；p19-p27 的原有文件系统和数据将不可识别")
+    LOGGER.warning(
+        "rootfs: %d MiB -> %d MiB",
+        generated.rootfs_old_mib,
+        generated.rootfs_new_mib,
+    )
+    LOGGER.warning(
+        "storage: %.2f MiB -> %.2f MiB",
+        generated.storage_old_mib,
+        generated.storage_new_mib,
+    )
+    LOGGER.warning("设备专属 GPT: %s", generated.path)
+    LOGGER.warning("SHA256: %s", generated.sha256)
+    LOGGER.warning("已完整校验备份: %s", plan.backup.path)
+    for change in generated.changes:
+        LOGGER.warning(
+            "p%d %s: %d-%d -> %d-%d",
+            change.number,
+            change.label,
+            change.old_first_lba,
+            change.old_last_lba,
+            change.new_first_lba,
+            change.new_last_lba,
+        )
+    try:
+        typed = input(f"请输入 {plan.confirmation_phrase} 以确认写 GPT: ").strip()
+    except EOFError:
+        return False
+    return typed == plan.confirmation_phrase
+
+
 def run_firmware_flash(args: argparse.Namespace) -> Path:
     """Reach U-Boot Web, validate twice, and execute the guarded firmware write."""
 
@@ -329,6 +378,63 @@ def run_firmware_flash(args: argparse.Namespace) -> Path:
     return flasher.flash(confirm_firmware_flash, auto_reboot=bool(args.firmware_reboot))
 
 
+def run_rootfs_resize(args: argparse.Namespace) -> Tuple[Path, Path]:
+    """Expand rootfs with a backup-derived GPT, then flash the locked Factory image."""
+
+    if args.force_device:
+        raise AthenaError("rootfs 扩容不允许使用 --force-device 绕过任何校验。")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = resolved_output(args.output, f"Athena_AX6600_rootfs_resize_{timestamp}")
+    project_root = Path(__file__).resolve().parents[2]
+    backup_dir = discover_backup(
+        Path(args.firmware_backup) if args.firmware_backup else None,
+        (project_root, Path.cwd()),
+    )
+    resizer = RootfsResizer(
+        args.uboot_web_url,
+        output,
+        backup_dir,
+        int(args.resize_rootfs),
+        timeout=float(args.firmware_timeout),
+    )
+    backup, generated = resizer.prepare()
+    flasher = FirmwareFlasher(
+        args.uboot_web_url,
+        output,
+        Path(args.firmware_image).expanduser().resolve(),
+        backup_dir,
+        timeout=float(args.firmware_timeout),
+    )
+    # Finish all local checks before allowing the first destructive confirmation.
+    flasher.validate_image()
+    flasher.validate_backup()
+    if resizer.probe_version(required=False) is None:
+        LOGGER.info("U-Boot Web 尚未就绪，启动 uBootEnter")
+        entered = UbootEnterService().run(
+            args.resize_interface,
+            timeout=float(args.enter_timeout),
+            http_timeout=float(args.uboot_http_timeout),
+            open_browser=False,
+        )
+        resizer.set_web_url(entered.web_url)
+        flasher = FirmwareFlasher(
+            entered.web_url,
+            output,
+            Path(args.firmware_image).expanduser().resolve(),
+            backup_dir,
+            timeout=float(args.firmware_timeout),
+        )
+    resize_report = resizer.commit(backup, generated, confirm_rootfs_resize)
+    LOGGER.warning(
+        "GPT 已写入且未重启；继续刷写 Factory。若后续失败，请保持在 U-Boot 并重试固件刷写。"
+    )
+    firmware_report = flasher.flash(
+        confirm_firmware_flash,
+        auto_reboot=bool(args.firmware_reboot),
+    )
+    return resize_report, firmware_report
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
 
@@ -352,6 +458,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result.attempts,
                 result.elapsed_seconds,
             )
+            return 0
+        if args.resize_rootfs is not None:
+            resize_report, firmware_report = run_rootfs_resize(args)
+            LOGGER.info("rootfs 已调整为 %d MiB", args.resize_rootfs)
+            LOGGER.info("GPT 报告: %s", resize_report)
+            LOGGER.info("Factory 固件报告: %s", firmware_report)
+            if not args.firmware_reboot:
+                LOGGER.info("路由器仍停留在 U-Boot Web，请核对两份报告后手动重启。")
             return 0
         if args.flash_firmware is not None:
             report = run_firmware_flash(args)
