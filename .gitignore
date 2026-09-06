@@ -1,0 +1,33 @@
+# Python bytecode and package metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local environments and tool caches
+.venv/
+.coverage
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+
+# Build and release output
+build/
+dist/
+*.part
+
+# Router-generated backups and flash reports
+Athena_AX6600_backup_*/
+Athena_AX6600_uboot_flash_*/
+Athena_AX6600_firmware_flash_*/
+
+# Unlocked local/experimental firmware images
+/qualcommax-*.bin
+
+# Editor and operating-system noise
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+*.log

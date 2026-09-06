@@ -1,0 +1,6 @@
+* text=auto
+
+*.bin filter=lfs diff=lfs merge=lfs -text
+npcap-*.exe filter=lfs diff=lfs merge=lfs -text
+*.png binary
+*.docx binary

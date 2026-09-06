@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jdbox-athena-backup"
+version = "0.5.6"
+description = "JDCloud Athena AX6600 guarded backup and flashing utility"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+uboot-enter = ["scapy>=2.5,<3"]
+windows-gui = ["scapy>=2.5,<3", "pyinstaller>=6.8,<7"]
+
+[project.scripts]
+athena-backup = "jdbox_athena.cli:main"
+
+[project.gui-scripts]
+athena-gui = "jdbox_athena.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["src"]
+check_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
