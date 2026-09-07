@@ -22,6 +22,7 @@ from .constants import (
     DEFAULT_FACTORY_FIRMWARE_NAME,
     DEFAULT_HTTP_PORT,
     DEFAULT_MANAGEMENT_URL,
+    DEFAULT_OFFICIAL_RECOVERY_FIRMWARE_NAME,
     DEFAULT_TELNET_PORT,
     DEFAULT_UBOOT_IMAGE_NAME,
     DEFAULT_UBOOT_WEB_URL,
@@ -31,6 +32,10 @@ from .constants import (
 from .errors import AthenaError, OperationCancelled
 from .firmware_flash import FirmwareFlasher, FirmwareFlashPlan, discover_backup
 from .flash import UbootFlashPlan
+from .official_upgrade import (
+    OfficialFirmwareUpgrader,
+    OfficialUpgradePlan,
+)
 from .partition_resize import (
     ROOTFS_SIZE_CHOICES_MIB,
     RootfsResizePlan,
@@ -245,6 +250,8 @@ class OperationConfig:
     firmware_timeout: float
     open_browser: bool
     firmware_reboot: bool
+    telnet_recovery_enabled: bool
+    official_recovery_image: Path
     rootfs_size_mib: int
     verbose: bool
 
@@ -439,6 +446,10 @@ class AthenaGui:
         self.firmware_timeout = tk.StringVar(value="600")
         self.open_browser = tk.BooleanVar(value=True)
         self.firmware_reboot = tk.BooleanVar(value=False)
+        self.telnet_recovery_enabled = tk.BooleanVar(value=True)
+        self.official_recovery_image = tk.StringVar(
+            value=str(resource_path(DEFAULT_OFFICIAL_RECOVERY_FIRMWARE_NAME))
+        )
         self.rootfs_size = tk.StringVar(value="1024 MiB")
         self.verbose = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="就绪")
@@ -744,17 +755,31 @@ class AthenaGui:
                 text="仅在人工确认分区标签差异后绕过 APPSBL/ART 标签保护",
                 variable=self.force_device,
             ).grid(row=3, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=5)
+            ttk.Checkbutton(
+                self.details,
+                text="Telnet 开启失败时，使用内置原厂 r4211 恢复后重试",
+                variable=self.telnet_recovery_enabled,
+            ).grid(row=4, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=5)
+            self._add_entry(5, "原厂恢复固件", self.official_recovery_image, kind="file")
             warning = (
                 "只在你拥有或获准管理的设备上使用。默认 split 备份不会写分区；工具可能利用"
-                "原厂管理接口自动开启 Telnet，建议网线直连且暂时断开互联网。"
+                "原厂管理接口自动开启 Telnet。若启用 r4211 恢复，真正降级前会另行要求输入"
+                "确认短语；建议网线直连且暂时断开互联网。"
             )
         elif operation == "flash-uboot":
             self._add_entry(0, "U-Boot 镜像", self.uboot_image, kind="file")
             self._add_entry(1, "路由器临时挂载点", self.remote_target)
             self._add_entry(2, "电脑局域网 IP", self.pc_host)
+            ttk.Checkbutton(
+                self.details,
+                text="Telnet 开启失败时，使用内置原厂 r4211 恢复后重试",
+                variable=self.telnet_recovery_enabled,
+            ).grid(row=3, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=5)
+            self._add_entry(4, "原厂恢复固件", self.official_recovery_image, kind="file")
             warning = (
                 "将先备份 p13/p14，再严格校验设备、固定镜像哈希、远端上传和回读结果。"
-                "最终写入前必须输入哈希绑定确认短语；软件不会自动重启。写入期间绝对不要断电。"
+                "Telnet 失败时可先恢复 r4211；每次真正写入前都必须输入哈希绑定确认短语。"
+                "软件刷完 U-Boot 后不会自动重启，写入期间绝对不要断电。"
             )
         elif operation in {"flash-firmware", "resize-rootfs"}:
             row = 0
@@ -841,7 +866,7 @@ class AthenaGui:
         selected = filedialog.askopenfilename(
             parent=self.root,
             initialdir=str(initial.parent if initial.parent.exists() else Path.cwd()),
-            filetypes=(("固件镜像", "*.bin"), ("所有文件", "*.*")),
+            filetypes=(("固件镜像", "*.bin *.img"), ("所有文件", "*.*")),
         )
         if selected:
             variable.set(selected)
@@ -948,10 +973,19 @@ class AthenaGui:
 
         uboot_image = Path(self.uboot_image.get()).expanduser().resolve()
         firmware_image = Path(self.firmware_image.get()).expanduser().resolve()
+        official_recovery_image = (
+            Path(self.official_recovery_image.get()).expanduser().resolve()
+        )
         backup_text = self.firmware_backup.get().strip()
         firmware_backup = Path(backup_text).expanduser().resolve() if backup_text else None
         if operation == "flash-uboot" and not uboot_image.is_file():
             raise AthenaError(f"找不到 U-Boot 镜像：{uboot_image}")
+        if (
+            needs_login
+            and self.telnet_recovery_enabled.get()
+            and not official_recovery_image.is_file()
+        ):
+            raise AthenaError(f"找不到原厂 r4211 恢复固件：{official_recovery_image}")
         if operation in {"flash-firmware", "resize-rootfs"}:
             if not firmware_image.is_file():
                 raise AthenaError(f"找不到 Factory 固件：{firmware_image}")
@@ -989,6 +1023,8 @@ class AthenaGui:
             firmware_timeout=float(firmware_timeout),
             open_browser=bool(self.open_browser.get()),
             firmware_reboot=bool(self.firmware_reboot.get()),
+            telnet_recovery_enabled=bool(self.telnet_recovery_enabled.get()),
+            official_recovery_image=official_recovery_image,
             rootfs_size_mib=rootfs_size_mib,
             verbose=bool(self.verbose.get()),
         )
@@ -1105,9 +1141,17 @@ class AthenaGui:
         output: Optional[Path] = None
         try:
             if config.operation == "backup":
-                output = new_output_path(config.output_parent, "backup")
-                options = self._backup_options(config, "backup", output)
-                artifacts = AthenaBackupRunner(options).run()
+                recovery_output = new_output_path(config.output_parent, "backup")
+                output = recovery_output
+                options = self._backup_options(config, "backup", recovery_output)
+                artifacts = AthenaBackupRunner(
+                    options,
+                    recover_telnet=(
+                        (lambda error: self._recover_telnet(config, recovery_output, error))
+                        if config.telnet_recovery_enabled
+                        else None
+                    ),
+                ).run()
                 result = RunResult(
                     True,
                     "备份完成",
@@ -1115,11 +1159,17 @@ class AthenaGui:
                     output,
                 )
             elif config.operation == "flash-uboot":
-                output = new_output_path(config.output_parent, "flash-uboot")
-                options = self._backup_options(config, "flash-uboot", output)
+                recovery_output = new_output_path(config.output_parent, "flash-uboot")
+                output = recovery_output
+                options = self._backup_options(config, "flash-uboot", recovery_output)
                 artifacts = AthenaBackupRunner(
                     options,
                     confirm_uboot=self._confirm_uboot,
+                    recover_telnet=(
+                        (lambda error: self._recover_telnet(config, recovery_output, error))
+                        if config.telnet_recovery_enabled
+                        else None
+                    ),
                 ).run()
                 result = RunResult(
                     True,
@@ -1251,6 +1301,78 @@ class AthenaGui:
         self.events.put(("confirm", request))
         request.done.wait()
         return request.accepted
+
+    def _recover_telnet(
+        self,
+        config: OperationConfig,
+        output: Path,
+        telnet_error: Exception,
+    ) -> None:
+        """Run the explicitly confirmed stock r4211 fallback, then return for retry."""
+
+        management_url, _router_host = normalize_management_url(config.management_url)
+        upgrader = OfficialFirmwareUpgrader(
+            management_url,
+            config.official_recovery_image,
+            output,
+            config.username,
+            config.password,
+            cancel_event=self.cancel_event,
+        )
+        with self.cancel_lock:
+            if self.cancel_event.is_set():
+                raise OperationCancelled("任务已取消；没有提交原厂固件升级。")
+            self.cancel_allowed = True
+        self.events.put(("cancellable", True))
+        try:
+            LOGGER.warning("Telnet 开启失败，准备固定哈希的原厂 r4211 恢复流程")
+            plan = upgrader.prepare()
+        except OperationCancelled:
+            upgrader.cancel_before_write()
+            raise
+        finally:
+            with self.cancel_lock:
+                cancelled = self.cancel_event.is_set()
+                self.cancel_allowed = False
+            self.events.put(("cancellable", False))
+        if cancelled:
+            upgrader.cancel_before_write()
+            raise OperationCancelled("已取消原厂固件恢复；固件尚未写入闪存。")
+        if not self._confirm_official_upgrade(plan, telnet_error):
+            upgrader.cancel_before_write()
+            raise OperationCancelled("未确认降级；原厂固件尚未写入闪存。")
+        report = upgrader.commit_and_wait(plan)
+        LOGGER.info("原厂 r4211 恢复及重启完成，报告：%s", report)
+
+    def _confirm_official_upgrade(
+        self,
+        plan: OfficialUpgradePlan,
+        telnet_error: Exception,
+    ) -> bool:
+        check_label = "官方校验通过" if plan.firmware_check_status == 0 else "路由器标记为非官方"
+        details = (
+            f"触发原因：{telnet_error}\n"
+            f"设备型号：{plan.device_type}\n"
+            f"当前版本：{plan.current_release or '未知'}\n"
+            f"镜像：{plan.image.path}\n"
+            f"版本：JDCOS {plan.image.release}\n"
+            f"大小：{plan.image.size_bytes} bytes\n"
+            f"MD5：{plan.image.md5}\n"
+            f"SHA256：{plan.image.sha256}\n"
+            f"路由器复核：{check_label}（状态 {plan.firmware_check_status}）\n\n"
+            "确认后将通过原厂管理接口写入全量固件，并自动重启后再次开启 Telnet。"
+        )
+        return self._request_confirmation(
+            ConfirmationRequest(
+                title="确认恢复原厂 r4211",
+                warning=(
+                    "高风险：该全量镜像包含官方 U-Boot、启动链和系统固件，可能覆盖现有第三方 "
+                    "U-Boot，并可能清除设置。提交后不能取消；写入和重启期间绝对不要断电。"
+                ),
+                details=details,
+                phrase=plan.confirmation_phrase,
+            )
+        )
 
     def _confirm_uboot(self, plan: UbootFlashPlan) -> bool:
         details = (

@@ -2,10 +2,11 @@
 
 京东云雅典娜 AX6600（RE-CS-02）一站式备份与刷机工具，提供 Windows 图形界面和命令行入口。
 
-它可以在局域网内自动完成 Telnet 探测与开启、root 登录、设备识别、GPT 与 p1-p26 备份、
-U-Boot 刷写、免按 Reset 进入 U-Boot Web、Factory 固件刷写，以及受保护的 rootfs 扩容。
-Windows 发布包已包含运行环境、配套 U-Boot、Factory 固件、Scapy 和 Npcap 安装程序；正常使用
-不需要另外准备 Telnet 客户端、TFTP/HTTP 服务器或 uBootEnter，浏览器也不是必需组件。
+它可以在局域网内自动完成 Telnet 探测与开启、失败后恢复原厂 r4211 并重试、root 登录、设备识别、
+GPT 与 p1-p26 备份、U-Boot 刷写、免按 Reset 进入 U-Boot Web、Factory 固件刷写，以及受保护的
+rootfs 扩容。Windows 发布包已包含运行环境、原厂恢复固件、配套 U-Boot、Factory 固件、Scapy
+和 Npcap 安装程序；正常使用不需要另外准备 Telnet 客户端、TFTP/HTTP 服务器或 uBootEnter，
+浏览器也不是必需组件。
 
 当前版本：**v0.6.0**
 
@@ -26,7 +27,7 @@ Windows 发布包已包含运行环境、配套 U-Boot、Factory 固件、Scapy 
 
 | 任务 | 自动完成的操作 | 写入范围 |
 | --- | --- | --- |
-| 自动备份 / 开启 Telnet | 探测并开启 Telnet、校验设备、备份 GPT+p1-p26 或 raw 前缀、核对 MD5/SHA256 | 不写设备分区 |
+| 自动备份 / 开启 Telnet | 探测并开启 Telnet；失败时可确认恢复原厂 r4211 后重试；随后校验设备并完成备份 | 通常不写；确认恢复时写原厂全量固件 |
 | 刷写 U-Boot | 备份 p13/p14、校验锁定镜像、先写备用 APPSBL、再写主 APPSBL、逐个回读 | p14、p13 |
 | 进入 U-Boot Web | 通过网卡发送启动中断包，等待并验证 U-Boot Web | 不写设备分区 |
 | 刷写 Factory 固件 | 校验备份与锁定固件、上传 U-Boot 内存复核、写系统槽 0 | `0:HLOS`、`rootfs` |
@@ -62,6 +63,7 @@ Windows 发布包已包含运行环境、配套 U-Boot、Factory 固件、Scapy 
 | 电脑局域网 IP | 自动检测 | 根据管理地址和系统路由选择 |
 | rootfs 目标大小 | `1024 MiB` | 可选择 512、1024、2048、8192 MiB |
 | 输出父目录 | EXE 所在目录 | 每次运行新建带时间戳的目录，不覆盖旧结果 |
+| Telnet 失败恢复 | 开启 | 使用内置、固定哈希的 JDCOS `4.3.0.r4211`；真正写入前仍需确认 |
 
 新 Factory 固件首次启动后的默认值为：管理地址 `192.168.10.1`、管理密码为空、Wi-Fi 名称
 `OWRT`、Wi-Fi 密码 `12345678`。首次登录后请立即设置管理密码并修改无线密码。
@@ -76,8 +78,9 @@ Windows 发布包已包含运行环境、配套 U-Boot、Factory 固件、Scapy 
 
 ### 什么时候可以取消
 
-“取消当前任务”只在等待 U-Boot 启动或等待 Web 就绪的安全阶段启用。点击后会停止发包、监听和
-后续刷写流程。进入上传、校验或实际写入阶段后，该按钮会自动禁用。
+“取消当前任务”在等待 U-Boot 启动、等待 Web 就绪，以及原厂恢复固件上传到 `/tmp` 的安全阶段
+启用。点击后会停止当前安全阶段和后续刷写流程。原厂恢复固件完成校验并提交写入后，以及其他
+实际写入阶段，该按钮会自动禁用。
 
 如果取消前已经收到 `UBOOT:ABORTED`，路由器可能仍停留在 U-Boot，可手动访问
 `http://192.168.1.1/` 或重新启动路由器。
@@ -117,10 +120,28 @@ MD5/SHA256。
   `set_iptv_info` 策略。
 - 两种策略只能执行程序内置的 Telnet 开启命令；CLI 不提供任意命令执行入口。
 - JSON-RPC 返回成功不代表 Telnet 已开启，只有实际连接 TCP 23 成功后才会继续。
+- 两种策略均失败时，图形界面默认准备内置 JDCOS `4.3.0.r4211`。只有本地固定哈希、路由器端
+  上传大小/MD5 和 `firmware_check` 全部通过后，才显示独立的降级确认窗口。
+- 完整输入 `DOWNGRADE-R4211-...` 并确认后，工具调用原厂 `local_upgrade_action`，等待路由器
+  重启和管理接口恢复，再重新登录并尝试开启 Telnet。
 - Telnet 密码默认与路由器后台密码相同。服务可能在工具退出后继续存在，备份完成后请按当前
   固件的管理方式关闭 Telnet 或重启设备。
 
 原厂固件必须仍保留已知 `/jdcapi` 行为；已经修复相关接口的版本可能无法自动开启 Telnet。
+
+### Telnet 失败后的原厂 r4211 恢复
+
+该备用流程仅用于“自动备份 / 开启 Telnet”和“刷写 U-Boot”，并且只在管理登录成功、两种
+Telnet 开启策略均失败后触发。密码错误或管理接口无法登录时不会自动刷固件。
+
+恢复包是完整签名 FIT。工具会先通过只读的 `web_get_router_info` 确认型号为 `RE-CS-02`，再使用
+原厂页面的 `/cgi-bin/luci-upload`、`firmware_check` 和 `local_upgrade_action` 接口升级。它包含
+官方 U-Boot、启动链和系统固件，可能覆盖已安装的第三方 U-Boot，也可能清除路由器设置。提交后
+不能取消，写入和重启期间不能断电；如果不希望自动准备此流程，可在任务设置中取消勾选
+“Telnet 开启失败时，使用内置原厂 r4211 恢复后重试”。
+
+若提交请求后连接意外中断，报告会标记为 `write-result-unknown`。此时工具不会重复提交，请保持
+供电至少 10 分钟，再检查当前版本。
 
 ## 受保护地刷写 U-Boot
 
@@ -255,6 +276,13 @@ python athena_backup.py --resize-rootfs 1024 --resize-interface 7 `
 - MD5：`6608cce1adc444db393d00ceb3256515`
 - SHA256：`a2d706dc02a68159f90502d1b253c48bfb316e9e166033c520ec846b9094c1ab`
 
+### Telnet 失败备用原厂固件
+
+- 文件：`JDCOS-JDC02-4.3.0.r4211-9e319914fce041a0519e4445c4b77372-single-signed.img`
+- 大小：37,064,796 bytes
+- MD5：`9e319914fce041a0519e4445c4b77372`
+- SHA256：`1f568d59da273dbeee36cac4210e8f4d20c9468f2933bbfa068e4c16e6944e5d`
+
 </details>
 
 ## 从源码运行
@@ -306,7 +334,8 @@ dist\JDBox_Athena_v0.6.0\JDBox_Athena_v0.6.0.exe
 ```
 
 这是 PyInstaller 目录版程序，发布或移动时必须保留整个 `JDBox_Athena_v0.6.0` 目录。
-程序目录包含固定 U-Boot、Factory 固件、Npcap 安装器、README 和第三方声明，但不包含可视化教程。
+程序目录包含固定 U-Boot、Factory 固件、原厂 r4211 恢复固件、Npcap 安装器、README 和第三方
+声明，但不包含可视化教程。
 
 已经准备好构建环境时，可以跳过依赖安装：
 
@@ -331,6 +360,7 @@ dist\JDBox_Athena_v0.6.0\JDBox_Athena_v0.6.0.exe
 | `firmware-flash-report.json` | Factory 内存复核与写入报告 |
 | `gpt-rootfs-目标MiB.bin` | 从本机备份生成的设备专属 GPT |
 | `rootfs-resize-report.json` | GPT 几何变化、远端校验与写入报告 |
+| `official-firmware-upgrade-report.json` | Telnet 失败后原厂 r4211 的校验、提交和重启状态 |
 
 中途失败时，已经完成并通过校验的文件会保留；未完整完成的备份会在 `backup-info.json` 中标记为
 `incomplete`，不能作为后续刷写的合格恢复备份。
@@ -344,6 +374,7 @@ build_windows.ps1                     PyInstaller 构建脚本
 src/jdbox_athena/gui.py               图形界面、后台任务和风险确认
 src/jdbox_athena/backup.py            备份工作流与清理
 src/jdbox_athena/jdcapi.py            登录与两种 Telnet 开启策略
+src/jdbox_athena/official_upgrade.py  原厂 r4211 校验、上传、升级和重启等待
 src/jdbox_athena/device.py            设备、分区和磁盘几何校验
 src/jdbox_athena/transfer.py          HTTP 下载与 raw 流式传输
 src/jdbox_athena/flash.py             U-Boot 校验、双 APPSBL 写入与回读
@@ -371,6 +402,7 @@ python athena_backup.py --help
 - 只支持京东云雅典娜 AX6600（RE-CS-02 / IPQ6018）和项目锁定的 U-Boot/Factory 镜像。
 - 不提供自动恢复或一键回滚，备份文件需要用户自行妥善保存。
 - 自动开启 Telnet 依赖原厂固件仍保留兼容的 `/jdcapi` 行为。
+- 原厂 r4211 备用恢复会写入完整官方固件，无法保证保留第三方 U-Boot，也无法绕过原厂平台校验。
 - 自动进入 U-Boot 依赖兼容的配套 U-Boot、Scapy 和 Npcap。
 - rootfs 调整是破坏性重建布局，不会搬移 p19-p27 的旧文件系统，也不支持缩小。
 - 工具不能消除刷机风险；真实写入前仍应核对设备、镜像哈希、分区变化和确认短语。

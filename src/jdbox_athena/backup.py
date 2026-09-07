@@ -7,11 +7,11 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .constants import FIRST_PARTITION, LAST_PARTITION
 from .device import DeviceInspector
-from .errors import AthenaError
+from .errors import AthenaError, RpcError
 from .flash import ConfirmationCallback, UbootFlasher
 from .integrity import write_manifests
 from .jdcapi import JdcApiClient
@@ -21,6 +21,7 @@ from .transfer import RawStreamer, RemoteWorkspace, partition_filename
 from .util import is_tcp_open
 
 LOGGER = logging.getLogger(__name__)
+TelnetRecoveryCallback = Callable[[RpcError], None]
 
 
 @dataclass(frozen=True)
@@ -55,9 +56,11 @@ class AthenaBackupRunner:
         self,
         options: BackupOptions,
         confirm_uboot: Optional[ConfirmationCallback] = None,
+        recover_telnet: Optional[TelnetRecoveryCallback] = None,
     ) -> None:
         self.options = options
         self.confirm_uboot = confirm_uboot
+        self.recover_telnet = recover_telnet
         self.shell: Optional[MiniTelnet] = None
         self.workspace: Optional[RemoteWorkspace] = None
         self.artifacts: List[Artifact] = []
@@ -102,11 +105,25 @@ class AthenaBackupRunner:
         LOGGER.info("Telnet 未开放，使用后台密码调用 /jdcapi session/login")
         client = JdcApiClient(self.options.management_url, timeout=self.options.rpc_timeout)
         client.login(self.options.username, self.options.password)
-        self.telnet_strategy = client.enable_telnet(
-            host,
-            port,
-            wait_seconds=self.options.telnet_wait,
-        )
+        try:
+            self.telnet_strategy = client.enable_telnet(
+                host,
+                port,
+                wait_seconds=self.options.telnet_wait,
+            )
+        except RpcError as exc:
+            if self.recover_telnet is None:
+                raise
+            LOGGER.warning("两种 Telnet 开启策略均失败：%s", exc)
+            self.recover_telnet(exc)
+            LOGGER.info("原厂固件恢复完成，重新登录并开启 Telnet")
+            client = JdcApiClient(self.options.management_url, timeout=self.options.rpc_timeout)
+            client.login(self.options.username, self.options.password)
+            self.telnet_strategy = "r4211-recovery+" + client.enable_telnet(
+                host,
+                port,
+                wait_seconds=self.options.telnet_wait,
+            )
         LOGGER.info("Telnet 已开放，生效策略: %s", self.telnet_strategy)
 
     def connect_shell(self) -> MiniTelnet:

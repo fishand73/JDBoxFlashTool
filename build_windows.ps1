@@ -22,6 +22,7 @@ if (-not $SkipInstall) {
 $RequiredAssets = @(
     "uboot-ipq60xx-jdcloud_re-cs-02-260816_142236_3011049.bin",
     "ones20250-main-pure-ipq60xx-jdcloud_re-cs-02-squashfs-factory-26.08.30-10.38.06.bin",
+    "JDCOS-JDC02-4.3.0.r4211-9e319914fce041a0519e4445c4b77372-single-signed.img",
     "npcap-1.88.exe",
     "README.md",
     "THIRD_PARTY_NOTICES.md"

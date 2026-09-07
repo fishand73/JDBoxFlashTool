@@ -43,3 +43,7 @@ class FirmwareFlashError(AthenaError):
 
 class PartitionResizeError(AthenaError):
     """GPT validation, generation, upload, or partition-table write failed."""
+
+
+class OfficialFirmwareUpgradeError(AthenaError):
+    """The guarded original-firmware recovery workflow failed."""
